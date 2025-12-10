@@ -1,0 +1,17 @@
+[project]
+name = "gud"
+version = "0.1.0"
+description = "Diffusion utilities for consistent basis transforms, schedules, and sampling"
+readme = "README.md"
+authors = [
+    { name = "Mathis Gerdes", email = "MathisGerdes@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "bijx>=1.1.2",
+    "diffrax>=0.7.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"

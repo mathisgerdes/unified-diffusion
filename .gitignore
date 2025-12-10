@@ -1,0 +1,51 @@
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# packaging
+*.egg-info
+*.egg
+dist/
+
+# C extensions
+*.so
+
+# Virtual environments
+/env/
+/.venv/
+
+# Python version management
+.python-version
+
+# uv
+uv.lock
+
+# IDEs
+.idea/
+.virtual_documents/
+.vscode/
+.cursor/
+
+.ruff_cache/
+
+.hypothesis/
+
+# Data
+data/
+outputs/
+figs/
+.DS_Store
+
+slurm-*.out
+
+# Generated version file
+_version.py
+
+# Documentation
+docs/build/
+docs/source/_autosummary/
+docs/.jupyter_cache/
