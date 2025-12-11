@@ -39,6 +39,7 @@ data/
 outputs/
 figs/
 .DS_Store
+datasets/
 
 slurm-*.out
 
