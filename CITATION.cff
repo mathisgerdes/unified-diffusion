@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "GUD: Generation with Unified Diffusion"
+authors:
+- family-names: "Gerdes"
+  given-names: "Mathis"
+repository-code: "https://github.com/mathisgerdes/gud"
+url: "https://arxiv.org/abs/2410.02667"
+license: MIT
+preferred-citation:
+  type: article
+  authors:
+  - family-names: "Gerdes"
+    given-names: "Mathis"
+  - family-names: "Welling"
+    given-names: "Max"
+  - family-names: "Cheng"
+    given-names: "Miranda C. N."
+  journal: "arXiv preprint"
+  title: "GUD: Generation with Unified Diffusion"
+  identifiers:
+  - type: url
+    value: "https://arxiv.org/abs/2410.02667"
+  - type: other
+    value: "arXiv:2410.02667"
+  notes: "primaryClass=cs.LG"
+  year: 2024
