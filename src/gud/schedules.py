@@ -45,24 +45,15 @@ Use NoisingState.broadcast_dims()/match_batch_dim() to obtain
 
 Component-wise Schedules
 ------------------------
-Two implementations for component-wise diffusion:
+LinearSchedule covers both simultaneous and offset/clipped trajectories by
+choosing per-component γ_min,i/γ_max,i and optional clipping. Factories
+(`soft_conditioning_schedule`, `variance_adjusted_schedule`, `column_schedule`,
+`row_schedule`) compute endpoints/offsets and return LinearSchedule instances.
 
-1. LinearSchedule: Simple extension of gamma-linear schedules.
-    Each component has its own γ_min,i and γ_max,i values, evolving simultaneously
-    from t=0 to t=1.
-
-   γ_i(t) = γ_min,i + t · (γ_max,i - γ_min,i)
-
-2. SequentialSchedule: Components have time offsets τ_i with clipping,
-   creating hierarchical generation where components noising starts sequentially.
-
-   γ_i(t) = clip(γ_min + (t - τ_i)·slope, γ_min, γ_max)
-
-Two design parameters are:
-- labels: Ordering variables l_i, controlling the effective order in which
-    components are noised (with respect to the SNR).
-- softness: How much the SNR trajectories overlap
-    (∞ = identical = standard diffusion, 0 = fully separated = autoregressive).
+Design parameters commonly used by the factories:
+- labels: ordering variables l_i that set relative noising order.
+- softness: overlap between component SNR trajectories
+  (∞ = identical = standard diffusion, 0 = fully separated/autoregressive).
 """
 
 from typing import Callable, Protocol
@@ -286,6 +277,8 @@ class LinearSchedule(nnx.Pytree):
     gamma_min: jax.Array = nnx.data(default_factory=lambda: jnp.array(-13.3))
     # γ at t=1 (low SNR). Scalar or (data_dim,)
     gamma_max: jax.Array = nnx.data(default_factory=lambda: jnp.array(5.0))
+    # Optional clipping range (low, high). If None, no clipping is applied.
+    gamma_cap: tuple[jax.Array | float, jax.Array | float] | None = nnx.data(default=None)
 
     @property
     def is_componentwise(self) -> bool:
@@ -297,10 +290,19 @@ class LinearSchedule(nnx.Pytree):
         """Total γ change: γ_max - γ_min."""
         return self.gamma_max - self.gamma_min
 
+    @property
+    def clipping(self) -> tuple[jax.Array | float, jax.Array | float] | None:
+        """Active clipping bounds or None if unclipped."""
+        return self.gamma_cap
+
     def gamma(self, t: jax.Array) -> jax.Array:
         if self.is_componentwise:
             t = jnp.expand_dims(t, -1)
-        return self.gamma_min + t * self.delta_gamma
+        gamma = self.gamma_min + t * self.delta_gamma
+        if self.gamma_cap is not None:
+            lo, hi = self.gamma_cap
+            gamma = jnp.clip(gamma, lo, hi)
+        return gamma
 
     def __call__(
         self,
@@ -310,71 +312,7 @@ class LinearSchedule(nnx.Pytree):
     ) -> NoisingState:
         gamma = self.gamma(t)
         sigma_sq = jax.nn.sigmoid(gamma)
-        # For linear schedule, dγ/dt = Δγ (constant)
-        beta = sigma_sq * self.delta_gamma
-        state = NoisingState(gamma=gamma, t=t, beta=beta)
-        return state.broadcast_dims(shape=shape)
-
-
-@nnx.dataclass
-class SequentialSchedule(nnx.Pytree):
-    """Component-wise schedule with time offsets and clipping.
-
-    Each component i has time offset τ_i. The effective schedule is:
-
-        γ_i(t) = clip(γ_min + (t - τ_i) · slope, γ_min, γ_max)
-
-    where slope = Δγ / (1 - τ_range) compensates for the compressed active time.
-
-    This creates sequential noising: components with larger τ_i wait at γ_min
-    until their "turn", then traverse to γ_max.
-
-    The offset range τ_range = max(τ) - min(τ) controls sequentiality:
-        - τ_range = 0: All components noised together (standard diffusion)
-        - τ_range → 1: Fully autoregressive (one at a time)
-    """
-    gamma_min: jax.Array  # γ at t=0 (high SNR)
-    gamma_max: jax.Array  # γ at t=1 (low SNR)
-    offsets: jax.Array    # Per-component time offsets, shape (data_dim,)
-    normalize: bool = True  # Whether to normalize offsets so min is 0
-
-    @property
-    def offsets_normalized(self) -> jax.Array:
-        if self.normalize:
-            return self.offsets - jnp.min(self.offsets)
-        return self.offsets
-
-    @property
-    def offset_range(self) -> jax.Array:
-        """Range of offsets τ_max - τ_min (after normalization, just max)."""
-        return jnp.max(self.offsets_normalized)
-
-    @property
-    def delta_gamma(self) -> float:
-        return self.gamma_max - self.gamma_min
-
-    @property
-    def slope(self) -> jax.Array:
-        """Slope of γ(t) in active region, adjusted for offset range."""
-        # Avoid division by zero when offset_range ≈ 1
-        active_time = jnp.maximum(1.0 - self.offset_range, 1e-6)
-        return self.delta_gamma / active_time
-
-    def gamma(self, t: jax.Array) -> jax.Array:
-        t = jnp.expand_dims(t, -1)  # (batch,) → (batch, 1) for broadcasting
-        gamma = self.gamma_min + (t - self.offsets_normalized) * self.slope
-        return jnp.clip(gamma, self.gamma_min, self.gamma_max)
-
-    def __call__(
-        self,
-        t: jax.Array,
-        *,
-        shape: tuple[int, ...] | None = None,
-    ) -> NoisingState:
-        gamma = self.gamma(t)
-        sigma_sq = jax.nn.sigmoid(gamma)
-        # β = σ² · dγ/dt, but dγ/dt = 0 outside active region due to clipping
-        # Use autodiff to get correct β including clip boundaries
+        # Use autodiff so clipping (if present) zeros out β where γ is flat.
         _, dgamma_dt = jax.jvp(self.gamma, (t,), (jnp.ones_like(t),))
         beta = sigma_sq * dgamma_dt
         state = NoisingState(gamma=gamma, t=t, beta=beta)
@@ -389,14 +327,23 @@ class SequentialSchedule(nnx.Pytree):
 def linear_schedule(
     gamma_min: float | jax.Array = -13.3,
     gamma_max: float | jax.Array = 5.0,
+    *,
+    gamma_cap: tuple[float | jax.Array, float | jax.Array] | None = None,
+    clip: bool = False,
 ) -> LinearSchedule:
     """Create linear γ schedule.
 
     Standard bounds: γ_min ≈ -13.3 (SNR ≈ 10⁶), γ_max ≈ 5 (SNR ≈ 0.007).
+    Set clip=True to clamp γ to [gamma_min, gamma_max], or pass gamma_cap
+    explicitly for asymmetric clipping.
     """
+    cap = gamma_cap
+    if clip and cap is None:
+        cap = (jnp.asarray(gamma_min), jnp.asarray(gamma_max))
     return LinearSchedule(
         gamma_min=jnp.asarray(gamma_min),
         gamma_max=jnp.asarray(gamma_max),
+        gamma_cap=cap,
     )
 
 
@@ -499,7 +446,9 @@ def sequential_offsets(
 ) -> jax.Array:
     """Compute time offsets for sequential schedules.
 
-    Maps labels to time offsets τ_i ∈ [0, τ_max] where τ_max = 1 - 1/softness.
+    Maps labels to time offsets τ_i ∈ [0, τ_max] where larger softness means
+    smaller τ_max (more overlap), and smaller softness means larger τ_max
+    (more sequential).
 
     Args:
         labels: Ordering variables l_i, shape (data_dim,).
@@ -520,9 +469,41 @@ def sequential_offsets(
         jnp.zeros_like(labels),
     )
 
-    # Scale to [0, τ_max] where τ_max determines sequentiality
-    tau_max = jnp.clip(1.0 - 1.0 / softness, 0.0, 0.99)
+    # Scale to [0, τ_max] where τ_max determines sequentiality:
+    # softness ↑ → tau_max ↓ (more overlap), softness ↓ → tau_max ↑ (more sequential).
+    tau_max = jnp.clip(1.0 / softness, 0.0, 0.99)
     return normalized * tau_max
+
+
+def offsets_to_linear_schedule(
+    offsets: jax.Array,
+    gamma_min: float | jax.Array,
+    gamma_max: float | jax.Array,
+    normalize: bool = True,
+) -> LinearSchedule:
+    """Fold sequential offsets into a clipped LinearSchedule.
+
+    Produces the exact γ(t) and β(t) that SequentialSchedule implemented:
+    - components wait at γ_min until their offset
+    - then rise with slope Δγ / (1 - τ_range)
+    - and clip at γ_max.
+    """
+    offsets = jnp.asarray(offsets)
+    gamma_min = jnp.asarray(gamma_min)
+    gamma_max = jnp.asarray(gamma_max)
+
+    if normalize:
+        offsets = offsets - jnp.min(offsets)
+
+    offset_range = jnp.max(offsets)
+    active_time = jnp.maximum(1.0 - offset_range, 1e-6)
+    delta_gamma = gamma_max - gamma_min
+    slope = delta_gamma / active_time
+
+    gamma_min_i = gamma_min - offsets * slope
+    gamma_max_i = gamma_min_i + slope
+    cap = (gamma_min, gamma_max)
+    return LinearSchedule(gamma_min=gamma_min_i, gamma_max=gamma_max_i, gamma_cap=cap)
 
 
 def soft_conditioning_schedule(
@@ -530,6 +511,9 @@ def soft_conditioning_schedule(
     gamma_min_target: float = -7.0,
     gamma_max_target: float = 3.0,
     softness: float = 1.0,
+    *,
+    gamma_cap: tuple[float | jax.Array, float | jax.Array] | None = None,
+    clip: bool = False,
 ) -> LinearSchedule:
     """Create a soft-conditioning linear schedule from labels.
 
@@ -542,6 +526,8 @@ def soft_conditioning_schedule(
         gamma_min_target: Target log-SNR at t=0 for "first" components.
         gamma_max_target: Target log-SNR at t=1 for "last" components.
         softness: Overlap parameter (larger = more overlap = softer).
+        gamma_cap: Optional asymmetric clipping bounds (low, high).
+        clip: If True and gamma_cap is None, clip to [gamma_min, gamma_max].
 
     Returns:
         LinearSchedule with per-component endpoints.
@@ -549,7 +535,11 @@ def soft_conditioning_schedule(
     gamma_min, gamma_max = componentwise_linear_endpoints(
         labels, gamma_min_target, gamma_max_target, softness
     )
-    return LinearSchedule(gamma_min, gamma_max)
+    cap = gamma_cap
+    if clip:
+        # Clip to the intended target bounds, not the expanded endpoints.
+        cap = (jnp.asarray(gamma_min_target), jnp.asarray(gamma_max_target)) if cap is None else cap
+    return LinearSchedule(gamma_min, gamma_max, cap)
 
 
 def variance_adjusted_schedule(
@@ -558,6 +548,9 @@ def variance_adjusted_schedule(
     gamma_max_snr: float = 3.0,
     softness: float = 1.0,
     ordering: jax.Array | None = None,
+    *,
+    gamma_cap: tuple[float | jax.Array, float | jax.Array] | None = None,
+    clip: bool = False,
 ) -> LinearSchedule:
     """Create schedule adjusted for per-component data variance.
 
@@ -581,6 +574,8 @@ def variance_adjusted_schedule(
                   softness>1: Less separated (SNR trajectories more similar)
         ordering: Ordering variables l_i. If None, uses -log(variances),
                   which at softness=1 gives standard diffusion behavior.
+        gamma_cap: Optional clipping bounds (low, high) in γ space.
+        clip: If True and gamma_cap is None, clip to [gamma_min, gamma_max].
 
     Returns:
         LinearSchedule with variance-adjusted per-component endpoints.
@@ -609,7 +604,10 @@ def variance_adjusted_schedule(
         gamma_max_target=gamma_max_snr,
         softness=1.0,  # Already incorporated into labels
     )
-    return LinearSchedule(gamma_min, gamma_max)
+    cap = gamma_cap
+    if clip and cap is None:
+        cap = (gamma_min, gamma_max)
+    return LinearSchedule(gamma_min, gamma_max, cap)
 
 
 def column_schedule(
@@ -618,7 +616,7 @@ def column_schedule(
     gamma_min: float = -13.0,
     gamma_max: float = 5.0,
     softness: float = 2.0,
-) -> SequentialSchedule:
+) -> LinearSchedule:
     """Create column-wise sequential schedule for 2D spatial data.
 
     For generating images column-by-column (left to right).
@@ -636,7 +634,8 @@ def column_schedule(
         softness: Controls overlap between columns.
 
     Returns:
-        SequentialSchedule with offsets of shape (n_rows * n_cols,).
+        LinearSchedule equivalent to the sequential-offset construction,
+        with offsets of shape (n_rows * n_cols,) folded into γ endpoints.
 
     Example:
         >>> # For 32x32 images flattened to (batch, 1024, channels)
@@ -651,10 +650,10 @@ def column_schedule(
     # Row-major: [col_0, col_1, ..., col_{n-1}] repeated n_rows times
     offsets = jnp.tile(col_offsets, n_rows)
 
-    return SequentialSchedule(
+    return offsets_to_linear_schedule(
+        offsets=offsets,
         gamma_min=jnp.asarray(gamma_min),
         gamma_max=jnp.asarray(gamma_max),
-        offsets=offsets,
     )
 
 
@@ -664,7 +663,7 @@ def row_schedule(
     gamma_min: float = -13.0,
     gamma_max: float = 5.0,
     softness: float = 2.0,
-) -> SequentialSchedule:
+) -> LinearSchedule:
     """Create row-wise sequential schedule for 2D spatial data.
 
     For generating images row-by-row (top to bottom).
@@ -678,7 +677,8 @@ def row_schedule(
         softness: Controls overlap between rows.
 
     Returns:
-        SequentialSchedule with offsets of shape (n_rows * n_cols,).
+        LinearSchedule equivalent to the sequential-offset construction,
+        with offsets of shape (n_rows * n_cols,) folded into γ endpoints.
     """
     # Create per-row offsets
     row_labels = jnp.arange(n_rows, dtype=jnp.float32)
@@ -688,8 +688,8 @@ def row_schedule(
     # Row-major: [row_0]*n_cols, [row_1]*n_cols, ...
     offsets = jnp.repeat(row_offsets, n_cols)
 
-    return SequentialSchedule(
+    return offsets_to_linear_schedule(
+        offsets=offsets,
         gamma_min=jnp.asarray(gamma_min),
         gamma_max=jnp.asarray(gamma_max),
-        offsets=offsets,
     )
