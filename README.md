@@ -7,6 +7,10 @@ This code implements the methods described in the paper: [GUD: Generation with U
 
 ## Tutorial Dependencies
 
+First, install the package with `pip install gud` (depending on your setup, probably in a new virtual environment, or instead with `uv`).
+
+Alternatively, it can be installed directly from the github repository via `pip install git+https://github.com/mathisgerdes/unified-diffusion.git`.
+
 The tutorial notebooks require additional packages beyond the core dependencies.
 Install them with:
 
